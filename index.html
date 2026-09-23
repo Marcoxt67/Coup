@@ -289,6 +289,10 @@
   .plist li.bot { opacity: 0.7; border-style: dashed; }
   .tag-h { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block; flex: none; }
   .seat.left .tag-h { background: var(--muted); }
+  .netstatus { position: fixed; top: calc(10px + env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%); z-index: 60;
+    background: var(--surface-2); border: 1px solid var(--brass-dim); color: var(--text); border-radius: 999px; padding: 6px 14px;
+    font-size: 13px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); display: flex; gap: 8px; align-items: center; }
+  .netstatus .dots { color: var(--brass); }
 
   /* ---------- phones ---------- */
   button, select, input, .seat { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -329,9 +333,9 @@
   html, body { margin: 0; }
   [hidden] { display: none !important; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 </head>
 <body>
+<div class="netstatus" id="netstatus" role="status" hidden><span class="dots"><span></span><span></span><span></span></span>Reconectando…</div>
 <div class="wrap">
   <header>
     <div class="brand">
@@ -504,7 +508,6 @@
     { skin: '#e2a984', hair: '#c9c9c9', style: 'bald', outfit: '#5b4a2e', mustache: true },
   ];
   const BOT_NAMES = ['Valéria', 'Otávio', 'Beatriz', 'Rodrigo', 'Helena', 'Lúcio', 'Marina', 'Teodoro'];
-  const PREFIX = 'coup-mesa-mx67-';
   const ABORT = Symbol('abort');
   const MAX_PLAYERS = 6;
 
@@ -1542,7 +1545,138 @@
     store.set('coup-name', n);
     return n;
   }
-  const peerOpts = { debug: 0, config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:global.stun.twilio.com:3478' }] } };
+
+  // ---------- relay: the game's server passes messages between the host and each guest ----------
+  // Works on any network (no direct browser-to-browser link) and reconnects on its own when a
+  // phone drops the connection; the server holds messages until the player is back.
+  function makeConn(sendFn, closeFn) {
+    const handlers = {};
+    const c = {
+      open: true,
+      send(msg) { if (c.open) sendFn(msg); },
+      close() { if (c.open) closeFn(); },
+      on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); },
+      _emit(ev, arg) { (handlers[ev] || []).forEach((fn) => fn(arg)); },
+    };
+    return c;
+  }
+  function Relay() {
+    const R = { ws: null, code: null, token: null, id: null, ready: false, closed: false, retry: 0, outbox: [], handlers: {}, conns: new Map(), hostConn: null, first: null, ping: null };
+    const emit = (ev, ...a) => (R.handlers[ev] || []).forEach((fn) => fn(...a));
+    const raw = (o) => {
+      if (R.closed) return;
+      if (R.ready && R.ws && R.ws.readyState === 1) R.ws.send(JSON.stringify(o));
+      else R.outbox.push(o);
+    };
+    const flushOutbox = () => { const q = R.outbox; R.outbox = []; q.forEach(raw); };
+    const closeAll = (reason) => {
+      R.conns.forEach((c) => { c.open = false; c._emit('close', reason); });
+      R.conns.clear();
+      if (R.hostConn && R.hostConn.open) { R.hostConn.open = false; R.hostConn._emit('close', reason); }
+    };
+    function guestConn(id) {
+      const c = makeConn((msg) => raw({ t: 'send', to: id, data: msg }), () => {
+        raw({ t: 'kick', id });
+        R.conns.delete(id);
+        c.open = false;
+        c._emit('close', 'kicked');
+      });
+      R.conns.set(id, c);
+      return c;
+    }
+    function onServer(m) {
+      switch (m.t) {
+        case 'hosted':
+          Object.assign(R, { code: m.code, token: m.token, id: 'h', ready: true });
+          flushOutbox();
+          emit('hosted', m.code);
+          break;
+        case 'joined':
+          Object.assign(R, { code: m.code, token: m.token, id: m.id, ready: true });
+          R.hostConn = makeConn((msg) => raw({ t: 'send', to: 'h', data: msg }), () => R.destroy());
+          flushOutbox();
+          emit('open', R.hostConn);
+          break;
+        case 'resumed': R.ready = true; flushOutbox(); break;
+        case 'open': if (R.id === 'h' && !R.conns.has(m.from)) emit('connection', guestConn(m.from)); break;
+        case 'data': {
+          const c = R.id === 'h' ? R.conns.get(m.from) : R.hostConn;
+          if (c && c.open) c._emit('data', m.data);
+          break;
+        }
+        case 'close': {
+          const c = R.conns.get(m.from);
+          if (c) { R.conns.delete(m.from); c.open = false; c._emit('close', 'left'); }
+          break;
+        }
+        case 'closed':
+          R.closed = true;
+          closeAll(m.reason);
+          try { R.ws.close(); } catch (e) { /* already closed */ }
+          break;
+        case 'error':
+          if (m.reason === 'expired') { R.closed = true; closeAll('expired'); try { R.ws.close(); } catch (e) { /* ignore */ } }
+          emit('error', m.reason);
+          break;
+      }
+    }
+    function connect() {
+      let ws;
+      try { ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'); }
+      catch (e) { emit('error', 'no-server'); return; }
+      R.ws = ws;
+      ws.onopen = () => {
+        R.retry = 0;
+        emit('online', true);
+        if (R.token) ws.send(JSON.stringify({ t: 'resume', code: R.code, token: R.token }));
+        else ws.send(JSON.stringify(R.first));
+      };
+      ws.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch (err) { return; } if (m && typeof m === 'object') onServer(m); };
+      ws.onclose = () => {
+        if (R.ws === ws) R.ws = null;
+        R.ready = false;
+        if (R.closed) { emit('online', true); return; }
+        if (!R.token && R.retry >= 4) { R.closed = true; emit('error', 'no-server'); return; }
+        emit('online', false);
+        setTimeout(connect, Math.min(8000, 700 * 2 ** R.retry++));
+      };
+    }
+    // Phones pause pages in the background; reconnect right away when the game comes back on screen.
+    const wake = () => { if (!R.closed && document.visibilityState === 'visible' && (!R.ws || R.ws.readyState > 1)) { R.retry = 0; connect(); } };
+    document.addEventListener('visibilitychange', wake);
+    Object.assign(R, {
+      on(ev, fn) { (R.handlers[ev] = R.handlers[ev] || []).push(fn); },
+      start(firstMsg) {
+        R.first = firstMsg;
+        connect();
+        R.ping = setInterval(() => { if (R.ws && R.ws.readyState === 1) R.ws.send('{"t":"ping"}'); }, 25000);
+      },
+      destroy() {
+        if (R.closed) return;
+        if (R.ws && R.ws.readyState === 1 && R.ready) R.ws.send(JSON.stringify({ t: 'leave' }));
+        R.closed = true;
+        clearInterval(R.ping);
+        document.removeEventListener('visibilitychange', wake);
+        try { if (R.ws) R.ws.close(); } catch (e) { /* ignore */ }
+        emit('online', true);
+      },
+      get destroyed() { return R.closed; },
+    });
+    return R;
+  }
+  let netTimer = null;
+  function setNetStatus(online) {
+    clearTimeout(netTimer);
+    if (online) { $('#netstatus').hidden = true; return; }
+    netTimer = setTimeout(() => { $('#netstatus').hidden = false; }, 1500);
+  }
+  function roomLost(text) {
+    if (S.game) { S.game.aborted = true; if (S.io) S.io.dropAll(); S.game = null; }
+    cancelLocalAsk();
+    S.peer = null;
+    show('home');
+    homeMsg(text, true);
+  }
 
   // ---------- host ----------
   function hostLobby(name, withPeer) {
@@ -1552,22 +1686,18 @@
     $('#bots').value = String(S.lobby.bots);
     if (!withPeer) { enterLobby(); return; }
     homeMsg('Criando a sala…');
-    const tryOpen = (attempt) => {
-      const code = randomCode();
-      const peer = new Peer(PREFIX + code, peerOpts);
-      peer.on('open', () => { S.peer = peer; S.code = code; enterLobby(); });
-      peer.on('connection', (conn) => {
-        conn.on('data', (msg) => hostOnData(conn, msg));
-        conn.on('close', () => hostOnClose(conn));
-        conn.on('error', () => hostOnClose(conn));
-      });
-      peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
-      peer.on('error', (err) => {
-        if (err.type === 'unavailable-id' && attempt < 4) { peer.destroy(); tryOpen(attempt + 1); return; }
-        if (!S.peer) homeMsg(`Não foi possível criar a sala (${err.type}). Verifique sua internet e tente de novo.`, true);
-      });
-    };
-    tryOpen(0);
+    const relay = Relay();
+    relay.on('hosted', (code) => { S.peer = relay; S.code = code; enterLobby(); });
+    relay.on('connection', (conn) => {
+      conn.on('data', (msg) => hostOnData(conn, msg));
+      conn.on('close', () => hostOnClose(conn));
+    });
+    relay.on('online', setNetStatus);
+    relay.on('error', (reason) => {
+      if (reason === 'expired') roomLost('A sala fechou porque você ficou fora do jogo por muito tempo. Crie uma sala nova.');
+      else if (!S.peer) homeMsg('Não consegui falar com o servidor do jogo. Verifique sua internet e tente de novo.', true);
+    });
+    relay.start({ t: 'host' });
   }
 
   function enterLobby() {
@@ -1688,15 +1818,22 @@
     S.role = 'guest';
     S.name = name;
     homeMsg('Procurando a sala…');
-    const peer = new Peer(peerOpts);
-    S.peer = peer;
+    const relay = Relay();
+    S.peer = relay;
     let opened = false;
-    peer.on('open', () => {
-      const conn = peer.connect(PREFIX + code, { reliable: true, serialization: 'json' });
-      const timer = setTimeout(() => { if (!opened) { homeMsg('Não encontrei essa sala. Confira o código ou peça um link novo.', true); peer.destroy(); } }, 12000);
-      conn.on('open', () => {
+    relay.on('online', setNetStatus);
+    relay.on('error', (reason) => {
+      if (reason === 'expired') { connectionLost('Você ficou fora do jogo por muito tempo e perdeu o lugar na mesa.'); return; }
+      if (!opened) {
+        homeMsg({ 'no-room': 'Não encontrei essa sala. Confira o código ou peça um link novo.', full: 'Essa sala está cheia (máximo de 6 jogadores).' }[reason]
+          || 'Não consegui falar com o servidor do jogo. Verifique sua internet e tente de novo.', true);
+        relay.destroy();
+        S.peer = null;
+      }
+    });
+    relay.on('open', (conn) => {
+      {
         opened = true;
-        clearTimeout(timer);
         S.hostConn = conn;
         S.code = code;
         conn.send({ t: 'hello', name });
@@ -1709,14 +1846,14 @@
         $('#guestinfo').textContent = 'Aguardando o anfitrião começar a partida…';
         homeMsg('');
         show('lobby');
-      });
+      }
       conn.on('data', guestOnData);
-      conn.on('close', () => { if (opened) connectionLost('A conexão com o anfitrião caiu.'); });
+      conn.on('close', (reason) => {
+        if (reason === 'kicked' || reason === 'expired') return;
+        connectionLost(reason === 'host-left' ? 'O anfitrião fechou a sala.' : 'A conexão com a sala caiu.');
+      });
     });
-    peer.on('error', (err) => {
-      if (err.type === 'peer-unavailable') homeMsg('Não encontrei essa sala. Confira o código ou peça um link novo.', true);
-      else if (!opened) homeMsg(`Erro de conexão (${err.type}). Tente de novo.`, true);
-    });
+    relay.start({ t: 'join', code });
   }
 
   function guestOnData(msg) {
@@ -1753,6 +1890,7 @@
   }
 
   function connectionLost(text) {
+    if (S.peer) { S.peer.destroy(); S.peer = null; }
     cancelLocalAsk();
     show('home');
     homeMsg(`${text} Peça um link novo ao anfitrião.`, true);
@@ -1766,7 +1904,7 @@
     $('#hometitle').textContent = 'Você foi convidado';
     $('#homelead').textContent = `Escreva seu nome e clique em Entrar para sentar na mesa da sala ${invited}.`;
   }
-  const peerReady = () => { if (window.Peer) return true; homeMsg('A conexão online não carregou. Recarregue a página.', true); return false; };
+  const peerReady = () => { if ('WebSocket' in window) return true; homeMsg('Este navegador não consegue jogar online. Tente outro navegador.', true); return false; };
   $('#create').addEventListener('click', () => { const n = readName(); if (n && peerReady()) hostLobby(n, true); });
   $('#solo').addEventListener('click', () => { const n = readName(); if (n) hostLobby(n, false); });
   $('#join').addEventListener('click', () => {
