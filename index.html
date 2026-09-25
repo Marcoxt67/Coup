@@ -293,13 +293,14 @@
      Wide screens: the wide artwork fills the screen and the menu is a compact bar in the bottom-left corner,
      over the city, so the title, the name and the character stay clear.
      Narrower screens: the tall cover spans the width at the top and the menu sits at the bottom.
-     A blurred, darkened copy fills whatever the picture leaves. The eye hides the interface to see the picture alone. */
+     White fills whatever the picture leaves. The eye hides the interface to see the picture alone. */
   :root { --vh: 100vh; }
   @supports (height: 100dvh) { :root { --vh: 100dvh; } }
   .homebg { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
     opacity: 0; visibility: hidden; transition: opacity .5s ease, visibility 0s linear .5s; }
   body.on-home .homebg { opacity: 1; visibility: visible; transition: opacity .5s ease; }
-  .homebg .fill { position: absolute; inset: -60px; background: var(--capa-wide) center / cover no-repeat; filter: blur(26px) brightness(0.3) saturate(1.2); }
+  /* the picture's own paper white fills whatever space the picture leaves, so it blends in with no visible edge */
+  .homebg .fill { position: absolute; inset: 0; background: #fbfbfa; }
   .homebg .cover { position: absolute; inset: 0; background: var(--capa-wide) center / contain no-repeat; }
   body.on-home .brand { visibility: hidden; }
   @media (min-width: 1150px) {
@@ -314,11 +315,10 @@
     #home .home > .msg:empty { display: none; }
   }
   @media (max-width: 1149px) {
-    .homebg .fill { background-image: var(--capa); }
     /* centred on the screen, always with a little room above and below */
     .homebg .cover { --cw: min(100vw, (var(--vh) - 28px) * 900 / 1599); inset: max(14px, calc((var(--vh) - var(--cw) * 1599 / 900) / 2)) auto auto calc(50% - var(--cw) / 2);
       width: var(--cw); aspect-ratio: 900 / 1599;
-      background-image: var(--capa); box-shadow: 0 10px 50px rgba(0, 0, 0, 0.55); transition: top .55s cubic-bezier(.2, .8, .2, 1); }
+      background-image: var(--capa); transition: top .55s cubic-bezier(.2, .8, .2, 1); }
     #home { min-height: calc(100vh - 80px); min-height: calc(var(--vh) - 80px); display: flex; flex-direction: column; justify-content: flex-end; }
     body #home .panel { background: color-mix(in srgb, var(--surface) 88%, transparent); }
   }
