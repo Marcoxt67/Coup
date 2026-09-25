@@ -694,6 +694,26 @@
     body.on-game .log { max-height: 560px; }
     body.on-game .rules li { color: #2b2320; }
   }
+  /* ---------- house rule: blind pick after a caught bluff ---------- */
+  .blindopt { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: var(--text); line-height: 1.25; }
+  .blindopt input { -webkit-appearance: none; appearance: none; flex: none; width: 20px; height: 20px; margin: 0; border: 1.5px solid #c9a45c; border-radius: 4px;
+    background: #071416; display: grid; place-items: center; cursor: pointer; }
+  .blindopt input::after { content: ""; width: 10px; height: 6px; border: solid #e6c27a; border-width: 0 0 2.5px 2.5px; transform: translateY(-2px) rotate(-45deg); opacity: 0; }
+  .blindopt input:checked { background: #0c2f31; }
+  .blindopt input:checked::after { opacity: 1; }
+  .blindopt input:focus-visible { outline: 2px solid #e6c27a; outline-offset: 2px; }
+  .blindpick button:hover .card { transform: translateY(-6px); }
+  .blindpick .card { transition: transform .15s; }
+  @media (max-width: 1149px) {
+    body #lobby .blindopt { font: 600 16px "Cormorant Garamond", Georgia, serif; color: #e6dccb; }
+  }
+  @media (min-width: 1150px) {
+    #lobbyplayers { height: calc(100% * 336 / 941); }
+    #lobby .blindopt { position: absolute; left: calc(100% * 318 / 1672); top: calc(100% * 784 / 941); width: calc(100% * 456 / 1672); margin: 0;
+      font: 600 calc(var(--lw) * 0.0102) "Cormorant Garamond", Georgia, serif; color: #e6dccb; }
+    #lobby .blindopt input { width: calc(var(--lw) * 0.0118); height: calc(var(--lw) * 0.0118); }
+  }
+
 </style>
 </head>
 <body>
@@ -779,6 +799,7 @@
               <option value="0.5">Rápido</option>
             </select>
           </label>
+          <label class="blindopt" for="blind"><input type="checkbox" id="blind" checked><span>Quem duvida e acerta escolhe a carta do mentiroso, às cegas</span></label>
           <button class="btn primary big" id="start">Começar partida</button>
           <p class="msg" id="startmsg"></p>
         </div>
@@ -1328,6 +1349,16 @@
       const finish = (r) => { if (View.pending !== P) return; View.pending = null; clearTargets(); setPrompt(waitingHTML('…')); resolve(r); };
       const P = { cancel: () => finish({ cancelled: true }) };
       View.pending = P;
+      if (spec.kind === 'blind') {
+        const n = Math.max(1, Math.min(4, spec.count | 0));
+        setPrompt(`<h2>${spec.title}</h2><p class="body">${spec.body}</p>
+          <div class="pick blindpick">${Array.from({ length: n }, (_, i) => `<button data-k="${i}" aria-label="Carta ${i + 1}"><div class="card"><div class="face back"></div></div></button>`).join('')}</div>`);
+        $('#prompt').querySelectorAll('.blindpick [data-k]').forEach((b) => b.addEventListener('click', () => {
+          b.classList.add('sel');
+          setTimeout(() => finish({ value: +b.dataset.k }), 250);
+        }));
+        return;
+      }
       if (spec.kind === 'pick') {
         const sel = new Set();
         const n = spec.n;
@@ -1371,6 +1402,7 @@
   function cancelLocalAsk() { if (View.pending) View.pending.cancel(); }
 
   function validAnswer(spec, v) {
+    if (spec.kind === 'blind') return Number.isInteger(v) && v >= 0 && v < spec.count;
     if (spec.kind === 'pick') {
       return Array.isArray(v) && v.length === spec.n && new Set(v).size === v.length && v.every((i) => Number.isInteger(i) && i >= 0 && i < spec.roles.length);
     }
@@ -1546,12 +1578,32 @@
     }
 
     // ---------- game steps ----------
-    async function loseInfluence(p) {
+    // `chooser`: someone else picks which card p loses, without seeing them (house rule after a caught bluff).
+    async function loseInfluence(p, chooser = null) {
       const live = p.cards.map((c, i) => i).filter((i) => !p.cards[i].dead);
       if (!live.length) return;
       let idx;
       if (live.length === 1) idx = live[0];
-      else if (p.human) {
+      else if (chooser && alive(chooser)) {
+        const random = () => Math.floor(Math.random() * live.length);
+        let k;
+        if (chooser.human) {
+          k = await io.ask(chooser, { kind: 'blind', count: live.length, title: 'Escolha a carta',
+            body: `O blefe de ${pn(p)} foi descoberto. Escolha uma das cartas de ${pn(p)}, sem ver, para ser revelada e perdida.` },
+            random, `${who(chooser)} está escolhendo, às cegas, uma carta de ${nm(p)}…`);
+          guard();
+        } else {
+          F('waiting', `${who(chooser)} está escolhendo, às cegas, uma carta de ${nm(p)}…`);
+          F('mood', chooser.id, 'think');
+          await wait(900);
+          F('mood', chooser.id, '');
+          k = random();
+        }
+        idx = live[k];
+        F('say', chooser.id, k === 0 ? 'Essa aqui!' : 'Quero essa!', 1400);
+        F('cardFx', p.id, idx, 'reveal');
+        await wait(700);
+      } else if (p.human) {
         const [k] = await io.ask(p, { kind: 'pick', title: 'Perca uma influência', body: 'Escolha a carta que você vai revelar e perder.', roles: live.map((i) => p.cards[i].role), n: 1, okLabel: 'Revelar esta carta' },
           () => [live.indexOf(botLoseIdx(p, live))]);
         guard();
@@ -1606,7 +1658,7 @@
       F('mood', claimer.id, 'sad');
       log(`${who(claimer)} não tinha ${chip(role)}. Blefe descoberto!`, 'bad');
       await wait(900);
-      await loseInfluence(claimer);
+      await loseInfluence(claimer, g.blindPick ? challenger : null);
       return false;
     }
 
@@ -2167,7 +2219,7 @@
     const players = seats.map((m, i) => ({ id: i, name: m.name, human: m.human, local: !!m.local, conn: m.conn || null, look: looks[i % looks.length], coins: 2, cards: [] }));
     const deck = shuffle(['duque', 'assassino', 'capitao', 'condessa', L.mode].flatMap((r) => [r, r, r]));
     players.forEach((p) => { p.cards = [{ role: deck.pop(), dead: false }, { role: deck.pop(), dead: false }]; });
-    const g = { players, deck, turn: Math.floor(Math.random() * players.length), log: [], active: null, over: false, aborted: false, mode: L.mode, pending: new Map() };
+    const g = { players, deck, turn: Math.floor(Math.random() * players.length), log: [], active: null, over: false, aborted: false, mode: L.mode, pending: new Map(), blindPick: $('#blind').checked };
     g.log.push({ h: `Nova partida com ${players.length} jogadores.`, k: '' });
     S.game = g;
     const setupFor = (viewer) => ({ viewer, mode: L.mode, speed: L.speed, players: players.map((p) => ({ id: p.id, name: p.name, look: p.look, human: p.human })) });
